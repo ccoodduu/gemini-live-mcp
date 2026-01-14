@@ -323,40 +323,51 @@ class AudioLoop:
         else:
             CONFIG = {"tools": tools, "response_modalities": ["AUDIO"]}
 
-        try:
-            async with (
-                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
-                asyncio.TaskGroup() as tg,
-            ):
-                self.session = session
+        max_retries = 5
+        retry_count = 0
 
-                self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=5)
+        while retry_count < max_retries:
+            try:
+                async with (
+                    client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                    asyncio.TaskGroup() as tg,
+                ):
+                    self.session = session
+                    retry_count = 0  # Reset on successful connection
 
-                send_text_task = tg.create_task(self.send_text())
+                    self.audio_in_queue = asyncio.Queue()
+                    self.out_queue = asyncio.Queue(maxsize=5)
 
-                if not self.text_only:
-                    tg.create_task(self.send_realtime())
-                    tg.create_task(self.listen_audio())
-                    tg.create_task(self.receive_audio())
-                    tg.create_task(self.play_audio())
+                    send_text_task = tg.create_task(self.send_text())
+
+                    if not self.text_only:
+                        tg.create_task(self.send_realtime())
+                        tg.create_task(self.listen_audio())
+                        tg.create_task(self.receive_audio())
+                        tg.create_task(self.play_audio())
+                    else:
+                        tg.create_task(self.receive_text_only())
+
+                    if self.video_mode == "camera":
+                        tg.create_task(self.get_frames())
+                    elif self.video_mode == "screen":
+                        tg.create_task(self.get_screen())
+
+                    await send_text_task
+                    raise asyncio.CancelledError("User requested exit")
+
+            except asyncio.CancelledError:
+                break
+            except (ExceptionGroup, Exception) as e:
+                retry_count += 1
+                if retry_count < max_retries:
+                    print(f"\n[Connection error, retrying {retry_count}/{max_retries}...]")
+                    await asyncio.sleep(2)
                 else:
-                    tg.create_task(self.receive_text_only())
-
-                if self.video_mode == "camera":
-                    tg.create_task(self.get_frames())
-                elif self.video_mode == "screen":
-                    tg.create_task(self.get_screen())
-
-                await send_text_task
-                raise asyncio.CancelledError("User requested exit")
-
-        except asyncio.CancelledError:
-            pass
-        except ExceptionGroup as EG:
-            if self.audio_stream:
-                self.audio_stream.close()
-            traceback.print_exception(EG)
+                    print(f"\n[Max retries reached, exiting]")
+                    if self.audio_stream:
+                        self.audio_stream.close()
+                    traceback.print_exception(e)
 
 
 if __name__ == "__main__":
