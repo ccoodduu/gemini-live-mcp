@@ -1,13 +1,8 @@
 {
-    "mcpServers": {
-        "sysinfo": {
-            "command": "uv",
-            "args": [
-                "--directory",
-                "D:\\WorksOfGreatness\\mcp-sysinfo",
-                "run",
-                "sysinfo.py"
-            ]
+    "mcpServers": {},
+    "sseServers": {
+        "tasker": {
+            "url": "http://localhost:8100/sse"
         }
     }
 }

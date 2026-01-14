@@ -21,13 +21,14 @@ import os
 import sys
 import traceback
 
-import cv2
 import pyaudio
-import PIL.Image
-import mss
-
 import argparse
 from dotenv import load_dotenv
+
+# Conditional imports for video modes
+cv2 = None
+mss = None
+PILImage = None
 
 from google import genai
 from google.genai import types
@@ -62,18 +63,27 @@ pya = pyaudio.PyAudio()
 
 
 class AudioLoop:
-    def __init__(self, video_mode=DEFAULT_MODE):
+    def __init__(self, video_mode=DEFAULT_MODE, text_only=False):
         self.video_mode = video_mode
+        self.text_only = text_only
+
+        # Import video dependencies only if needed
+        if video_mode in ("camera", "screen"):
+            global cv2, mss, PILImage
+            import cv2
+            import mss
+            from PIL import Image as PILImage
 
         self.audio_in_queue = None
         self.out_queue = None
 
         self.session = None
+        self.audio_stream = None
 
         self.send_text_task = None
         self.receive_audio_task = None
         self.play_audio_task = None
-        
+
         self.mcp_client = MCPClient()
 
     async def send_text(self):
@@ -110,16 +120,13 @@ class AudioLoop:
     
     async def handle_tool_call(self, tool_call):
         for fc in tool_call.function_calls:
-            result = await self.mcp_client.session.call_tool(
-                name=fc.name,
-                arguments=fc.args,
-            )
+            result = await self.mcp_client.call_tool(fc.name, fc.args or {})
             print(result)
             tool_response = types.LiveClientToolResponse(
                 function_responses=[types.FunctionResponse(
                     name=fc.name,
                     id=fc.id,
-                    response={'result':result},
+                    response={'result': result},
                 )]
             )
 
@@ -136,7 +143,7 @@ class AudioLoop:
         # OpenCV captures in BGR but PIL expects RGB format
         # This prevents the blue tint in the video feed
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = PIL.Image.fromarray(frame_rgb)  # Now using RGB frame
+        img = PILImage.fromarray(frame_rgb)  # Now using RGB frame
         img.thumbnail([1024, 1024])
 
         image_io = io.BytesIO()
@@ -174,7 +181,7 @@ class AudioLoop:
 
         mime_type = "image/jpeg"
         image_bytes = mss.tools.to_png(i.rgb, i.size)
-        img = PIL.Image.open(io.BytesIO(image_bytes))
+        img = PILImage.open(io.BytesIO(image_bytes))
 
         image_io = io.BytesIO()
         img.save(image_io, format="jpeg")
@@ -258,32 +265,50 @@ class AudioLoop:
             bytestream = await self.audio_in_queue.get()
             await asyncio.to_thread(stream.write, bytestream)
 
+    async def receive_text_only(self):
+        """Receive text responses only (no audio)."""
+        while True:
+            turn = self.session.receive()
+            async for response in turn:
+                if text := response.text:
+                    print(text, end="", flush=True)
+
+                server_content = response.server_content
+                if server_content is not None:
+                    self.handle_server_content(server_content)
+                    continue
+
+                tool_call = response.tool_call
+                if tool_call is not None:
+                    await self.handle_tool_call(tool_call)
+            print()  # newline after turn complete
+
     async def run(self):
         await self.mcp_client.connect_to_server()
-        available_tools = await self.mcp_client.session.list_tools()
-        
+        all_tools = await self.mcp_client.list_all_tools()
+
         functional_tools = []
-        for tool in available_tools.tools:
+        for server_name, tool in all_tools:
             tool_desc = {
-                    "name": tool.name,
-                    "description": tool.description
-                }
-            if tool.inputSchema["properties"]:
+                "name": tool.name,
+                "description": tool.description
+            }
+            if tool.inputSchema.get("properties"):
                 tool_desc["parameters"] = {
                     "type": tool.inputSchema["type"],
                     "properties": {},
                 }
                 for param in tool.inputSchema["properties"]:
                     tool_desc["parameters"]["properties"][param] = {
-                        "type": tool.inputSchema["properties"][param]["type"],
-                        "description": "",
+                        "type": tool.inputSchema["properties"][param].get("type", "string"),
+                        "description": tool.inputSchema["properties"][param].get("description", ""),
                     }
-                
+
             if "required" in tool.inputSchema:
                 tool_desc["parameters"]["required"] = tool.inputSchema["required"]
-                
+
             functional_tools.append(tool_desc)
-        print(functional_tools)
+        print(f"Loaded {len(functional_tools)} tools from MCP servers")
         tools = [
             {
                 'function_declarations': functional_tools,
@@ -292,8 +317,12 @@ class AudioLoop:
                 },
         ]
         
-        CONFIG = {"tools": tools, "response_modalities": ["AUDIO"]}
-        
+        if self.text_only:
+            CONFIG = {"tools": tools, "response_modalities": ["TEXT"]}
+            print("Running in TEXT-ONLY mode (no audio)")
+        else:
+            CONFIG = {"tools": tools, "response_modalities": ["AUDIO"]}
+
         try:
             async with (
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
@@ -305,23 +334,28 @@ class AudioLoop:
                 self.out_queue = asyncio.Queue(maxsize=5)
 
                 send_text_task = tg.create_task(self.send_text())
-                tg.create_task(self.send_realtime())
-                tg.create_task(self.listen_audio())
+
+                if not self.text_only:
+                    tg.create_task(self.send_realtime())
+                    tg.create_task(self.listen_audio())
+                    tg.create_task(self.receive_audio())
+                    tg.create_task(self.play_audio())
+                else:
+                    tg.create_task(self.receive_text_only())
+
                 if self.video_mode == "camera":
                     tg.create_task(self.get_frames())
                 elif self.video_mode == "screen":
                     tg.create_task(self.get_screen())
-
-                tg.create_task(self.receive_audio())
-                tg.create_task(self.play_audio())
 
                 await send_text_task
                 raise asyncio.CancelledError("User requested exit")
 
         except asyncio.CancelledError:
             pass
-        except asyncio.ExceptionGroup as EG:
-            self.audio_stream.close()
+        except ExceptionGroup as EG:
+            if self.audio_stream:
+                self.audio_stream.close()
             traceback.print_exception(EG)
 
 
@@ -334,6 +368,11 @@ if __name__ == "__main__":
         help="pixels to stream from",
         choices=["camera", "screen", "none"],
     )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="text input only, no audio",
+    )
     args = parser.parse_args()
-    main = AudioLoop(video_mode=args.mode)
+    main = AudioLoop(video_mode=args.mode, text_only=args.text_only)
     asyncio.run(main.run())
